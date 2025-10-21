@@ -10,7 +10,7 @@ This is a deliberately vulnerable web application built with Go and SQLite for C
 
 **This application contains intentional security vulnerabilities for training purposes.**
 
-- **DO NOT** deploy to production environments
+- **DO NOT** deply to production environments
 - **DO NOT** connect to public networks  
 - **DO NOT** use real credentials or sensitive data
 - **USE ONLY** in isolated training environments
