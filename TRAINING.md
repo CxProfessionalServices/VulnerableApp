@@ -119,6 +119,7 @@
 
 After completion, participants should understand:
 - How to identify and fix SQL injection vulnerabilities
+- Jira Scan
 - Secure coding practices for web applications
 - Dependency management and SCA scanning
 - Infrastructure security configuration
