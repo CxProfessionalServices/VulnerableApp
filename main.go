@@ -2,8 +2,14 @@ package main
 
 import (
 	"database/sql"
+	"encoding/xml"
 	"fmt"
+	"io"
 	"log"
+	"net/http"
+	"os"
+	"os/exec"
+	"regexp"
 	"strings"
 	"time"
 
@@ -30,6 +36,13 @@ type Comment struct {
 	UserID  int    `json:"user_id"`
 	Content string `json:"content"`
 	Date    string `json:"date"`
+}
+
+type ProfileImport struct {
+	XMLName xml.Name `xml:"profile"`
+	Name    string   `xml:"name"`
+	Email   string   `xml:"email"`
+	Bio     string   `xml:"bio"`
 }
 
 func main() {
@@ -70,6 +83,11 @@ func main() {
 		api.GET("/internal/debug", debugHandler)    // Vulnerable: Undocumented debug endpoint
 		api.POST("/internal/backup", backupHandler) // Vulnerable: Undocumented backup endpoint
 		api.GET("/internal/logs", logsHandler)      // Vulnerable: Undocumented logs endpoint
+
+		api.GET("/internal/ping", pingHandler)                     // Vulnerable: OS Command Injection
+		api.GET("/internal/files", fileDownloadHandler)            // Vulnerable: Path Traversal
+		api.POST("/internal/webhook/test", webhookTestHandler)     // Vulnerable: SSRF
+		api.POST("/internal/import/profile", profileImportHandler) // Vulnerable: XXE / Insecure XML parsing
 	}
 
 	fmt.Println("Server starting on :8080")
@@ -586,4 +604,93 @@ func logsHandler(c *gin.Context) {
 	}
 
 	c.JSON(200, response)
+}
+
+// Vulnerable: OS Command Injection - user-supplied host passed unsanitized to a shell
+func pingHandler(c *gin.Context) {
+	host := c.DefaultQuery("host", "127.0.0.1")
+
+	// Vulnerable: No input validation - shell metacharacters (;, |, $(), &&, backticks) are executed
+	cmd := exec.Command("sh", "-c", "ping -c 1 "+host)
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		c.JSON(500, gin.H{"error": err.Error(), "output": string(output)})
+		return
+	}
+
+	c.JSON(200, gin.H{"host": host, "output": string(output)})
+}
+
+// Vulnerable: Path Traversal - user-controlled filename concatenated into a file path
+func fileDownloadHandler(c *gin.Context) {
+	filename := c.DefaultQuery("name", "style.css")
+
+	// Vulnerable: No sanitization of "../" sequences before reading the file
+	data, err := os.ReadFile("./static/" + filename)
+	if err != nil {
+		c.JSON(404, gin.H{"error": err.Error()})
+		return
+	}
+
+	c.Data(200, "application/octet-stream", data)
+}
+
+// Vulnerable: Server-Side Request Forgery - no validation of the destination URL
+func webhookTestHandler(c *gin.Context) {
+	var req struct {
+		URL string `json:"url"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(400, gin.H{"error": err.Error()})
+		return
+	}
+
+	// Vulnerable: Server-side request to an arbitrary attacker-supplied URL,
+	// including internal/link-local/loopback addresses (SSRF)
+	resp, err := http.Get(req.URL)
+	if err != nil {
+		c.JSON(500, gin.H{"error": err.Error()})
+		return
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		c.JSON(500, gin.H{"error": err.Error()})
+		return
+	}
+
+	c.JSON(200, gin.H{"url": req.URL, "status_code": resp.StatusCode, "body": string(body)})
+}
+
+// Vulnerable: XML External Entity (XXE) Injection
+func profileImportHandler(c *gin.Context) {
+	body, err := io.ReadAll(c.Request.Body)
+	if err != nil {
+		c.JSON(400, gin.H{"error": err.Error()})
+		return
+	}
+	xmlData := string(body)
+
+	// Vulnerable: Manually resolving DTD-declared external entities and inlining local
+	// file contents before parsing, since encoding/xml doesn't process DOCTYPE/ENTITY itself
+	entityPattern := regexp.MustCompile(`<!ENTITY\s+(\w+)\s+SYSTEM\s+"([^"]+)"\s*>`)
+	for _, match := range entityPattern.FindAllStringSubmatch(xmlData, -1) {
+		entityName := match[1]
+		entityPath := strings.TrimPrefix(match[2], "file://")
+
+		// Vulnerable: Reading arbitrary local files referenced by the entity
+		fileContents, err := os.ReadFile(entityPath)
+		if err == nil {
+			xmlData = strings.ReplaceAll(xmlData, "&"+entityName+";", string(fileContents))
+		}
+	}
+
+	var profile ProfileImport
+	if err := xml.Unmarshal([]byte(xmlData), &profile); err != nil {
+		c.JSON(400, gin.H{"error": err.Error()})
+		return
+	}
+
+	c.JSON(200, gin.H{"name": profile.Name, "email": profile.Email, "bio": profile.Bio})
 }
